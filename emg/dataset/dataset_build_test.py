@@ -1,24 +1,38 @@
-from emg.io.loader import load_emg_dataset
-from emg.dataset.emg_dataset import EMGDatasetBuilder
+import numpy as np
+from emg.dataset.build_dataset import build_dataset
 
 
 def main():
+    print(">>> Building EMG dataset...")
 
-    subjects = load_emg_dataset("data/emg_data.h5")
+    dataset = build_dataset(
+        root="F:\跨力手势分类实验20260113\EMG_Data",
+        window_ms=100,
+        step_ms=50,
+    )
 
-    # 此时假设：
-    # - subjects 已完成 preprocess
-    # - 已完成 feature extraction + normalization
-    # - trial.features 已就绪
+    X = dataset["X"]
+    subject = dataset["subject"]
+    collector = dataset["collector"]
+    file_id = dataset["file"]
 
-    builder = EMGDatasetBuilder()
-    dataset = builder.build(subjects)
+    print("\n=== Dataset summary ===")
+    print(f"X shape        : {X.shape}  (N, C, F)")
+    print(f"subject shape  : {subject.shape}")
+    print(f"collector shape: {collector.shape}")
+    print(f"file shape     : {file_id.shape}")
 
-    print("Dataset constructed:")
-    print("X:", dataset["X"].shape)
-    print("gesture:", dataset["gesture"].shape)
-    print("force:", dataset["force"].shape)
-    print("trial:", dataset["trial"].shape)
+    print("\n=== Basic sanity checks ===")
+    print(f"X dtype        : {X.dtype}")
+    print(f"X min / max    : {X.min():.4f} / {X.max():.4f}")
+    print(f"X mean / std   : {X.mean():.4f} / {X.std():.4f}")
+
+    print("\n=== Subject distribution ===")
+    unique_subjects, counts = np.unique(subject, return_counts=True)
+    for s, c in zip(unique_subjects, counts):
+        print(f"  subject {s}: {c} windows")
+
+    print("\n>>> Dataset build check PASSED ✅")
 
 
 if __name__ == "__main__":
