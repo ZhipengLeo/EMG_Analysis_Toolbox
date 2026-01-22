@@ -1,192 +1,398 @@
-"""
-EMG Gesture Recognition Experiment Runner
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import accuracy_score
 
-This script ONLY orchestrates the existing EMG pipeline.
-NO signal processing / feature extraction / model definition here.
-"""
-
+from emg.features.normalize import SubjectNormalizer
 from emg.dataset.build_dataset import build_dataset
-
-from emg.preprocessing.emg_preprocessing_pipeline import (
-    run_emg_preprocessing
-)
-
-from emg.feature.feature_extraction_pipeline import (
-    run_feature_extraction
-)
-
-from emg.model.dataset.gesture_dataset_builder import (
-    build_single_force_dataset,
-    build_stratified_cross_force_dataset,
-    build_device_specific_dataset
-)
+from emg.dataset.split_dataset import split_by_force_level
 
 from emg.model.classical.svm import SVMClassifier
 from emg.model.deep_learning.cnn import EMGCNN
 from emg.model.deep_learning.lstm import EMGLSTM
 
-from emg.experiment.utils import (
-    split_train_test,
-    evaluate_model
-)
-
 from emg.experiment.report.reporter import ExperimentReporter
 from emg.experiment.report.visualizer import ExperimentVisualizer
 
 
-def run_experiment(config):
+# ===========================
+# 🔧 Experiment Configuration
+# ===========================
+
+DATA_ROOT = r"F:\跨力手势分类实验20260113\EMG_Data"
+OUTPUT_DIR = "outputs/gesture_recognition"
+
+WINDOW_MS = 100
+STEP_MS = 50
+
+FORCE_LEVELS = [10, 20, 30, 40]
+
+DEVICE_GROUPS = {
+    "dev0": [0],
+    "dev1": [1],
+    "dev0+dev1": [0, 1],
+}
+
+FEATURES_TO_RUN = [
+    "ALL", "RMS", "MAV", "VAR", "AAC", "SSC", "TTP", "MF", "MPF"
+]
+
+MODELS = ["SVM", "CNN", "LSTM"]
+
+EPOCHS = 20
+LR = 1e-3
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ===========================
+# 🔑 Dataset Mask
+# ===========================
+
+def apply_mask(dataset: dict, mask: np.ndarray) -> dict:
+    masked = {}
+    for k, v in dataset.items():
+        if k == "single_feature_data":
+            masked[k] = {feat: data[mask] for feat, data in v.items()}
+        else:
+            masked[k] = v[mask]
+    return masked
+
+
+# ===========================
+# 🔑 Label Remapping
+# ===========================
+
+def remap_labels(y_train, y_test, X_test):
+    classes = np.unique(y_train)
+    class_map = {c: i for i, c in enumerate(classes)}
+
+    y_train_m = np.array([class_map[y] for y in y_train])
+
+    valid_mask = np.isin(y_test, classes)
+    X_test = X_test[valid_mask]
+    y_test = y_test[valid_mask]
+    y_test_m = np.array([class_map[y] for y in y_test])
+
+    return y_train_m, y_test_m, X_test, valid_mask
+
+
+# ===========================
+# 🔥 Torch Training
+# ===========================
+
+def train_torch(model, X_train, y_train, X_test, y_test):
+    model.to(DEVICE)
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    X_train = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
+    y_train = torch.tensor(y_train, dtype=torch.long).to(DEVICE)
+    X_test = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+    y_test = torch.tensor(y_test, dtype=torch.long).to(DEVICE)
+
+    for _ in range(EPOCHS):
+        optimizer.zero_grad()
+        loss = loss_fn(model(X_train), y_train)
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        preds = torch.argmax(model(X_test), dim=1)
+
+    return (preds == y_test).float().mean().item()
+
+
+# ===========================
+# 🧠 LSTM Sequence Builder
+# ===========================
+
+def build_lstm_sequences(X, y, trial_ids):
     """
-    Execute the complete EMG gesture recognition pipeline
-    using EXISTING project modules.
+    return:
+        X_pad: (N_trials, T_max, D)
+        y_seq: (N_trials,)
+        lengths: (N_trials,)
     """
+    X_seq = []
+    y_seq = []
+    lengths = []
 
-    # =====================================================
-    # 1. Raw EMG → Dataset (h5 reading inside builder)
-    # =====================================================
-    dataset = build_emg_dataset(
-        data_root=config["data_root"],
-        subjects=config["subjects"],
-        gestures=config["gestures"]
-    )
+    for tid in np.unique(trial_ids):
+        mask = trial_ids == tid
 
-    # =====================================================
-    # 2. EMG preprocessing (band-pass + notch)
-    # =====================================================
-    dataset = run_emg_preprocessing(
-        dataset,
-        fs=config["fs"],
-        bandpass=config["bandpass"],
-        notch=config["notch"]
-    )
+        X_trial = X[mask]        # (T_i, C, F)
+        y_trial = y[mask]
 
-    # =====================================================
-    # 3. Feature extraction (time + frequency domain)
-    # =====================================================
-    dataset = run_feature_extraction(
-        dataset,
-        feature_list=config["features"],
-        window_size=config["window_size"],
-        window_step=config["window_step"]
-    )
+        assert np.all(y_trial == y_trial[0])
 
+        T, C, F = X_trial.shape
+        X_trial = X_trial.reshape(T, C * F)
+
+        X_seq.append(X_trial)
+        y_seq.append(y_trial[0])
+        lengths.append(T)
+
+    T_max = max(lengths)
+    D = X_seq[0].shape[1]
+
+    X_pad = np.zeros((len(X_seq), T_max, D), dtype=np.float32)
+
+    for i, seq in enumerate(X_seq):
+        X_pad[i, :seq.shape[0], :] = seq
+
+    return X_pad, np.array(y_seq), np.array(lengths)
+
+def train_torch_lstm(model, Xtr, ytr, len_tr, Xte, yte, len_te):
+    model.to(DEVICE)
+    loss_fn = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+
+    Xtr = torch.tensor(Xtr).to(DEVICE)
+    ytr = torch.tensor(ytr).long().to(DEVICE)
+    len_tr = torch.tensor(len_tr).to(DEVICE)
+
+    Xte = torch.tensor(Xte).to(DEVICE)
+    yte = torch.tensor(yte).long().to(DEVICE)
+    len_te = torch.tensor(len_te).to(DEVICE)
+
+    for _ in range(EPOCHS):
+        opt.zero_grad()
+        loss = loss_fn(model(Xtr, len_tr), ytr)
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        pred = torch.argmax(model(Xte, len_te), dim=1)
+
+    return (pred == yte).float().mean().item()
+
+
+# ===========================
+# 🚀 Run Models
+# ===========================
+
+def run_models(
+    X_train, y_train,
+    X_test, y_test,
+    trial_train, trial_test
+):
     results = {}
 
-    # =====================================================
-    # 4. Experiment loops
-    # =====================================================
-    for device_mode in config["device_modes"]:
+    # ---------- SVM ----------
+    if "SVM" in MODELS:
+        svm = SVMClassifier()
+        svm.fit(X_train, y_train)
+        results["SVM"] = accuracy_score(y_test, svm.predict(X_test))
 
-        results[device_mode] = {}
+    # ---------- Label remap ----------
+    y_train_m, y_test_m, X_test, valid_mask = remap_labels(
+        y_train, y_test, X_test
+    )
+    trial_test = trial_test[valid_mask]
 
-        # ---------- Setting A: single-force ----------
-        for f in config["force_levels"]:
+    if len(y_test_m) == 0:
+        return results
 
-            train_ds = build_single_force_dataset(dataset, f)
-            train_ds = build_device_specific_dataset(train_ds, device_mode)
+    n_channels = X_train.shape[1]
+    n_features = X_train.shape[2]
+    n_classes = len(np.unique(y_train_m))
 
-            for test_f in config["force_levels"]:
-                test_ds = build_single_force_dataset(dataset, test_f)
-                test_ds = build_device_specific_dataset(test_ds, device_mode)
-
-                results[device_mode][(f, test_f)] = run_models(
-                    train_ds, test_ds, config
-                )
-
-        # ---------- Setting B: cross-force ----------
-        train_ds = build_stratified_cross_force_dataset(
-            dataset,
-            config["force_levels"],
-            config["samples_per_force"]
+    # ---------- CNN ----------
+    if "CNN" in MODELS:
+        cnn = EMGCNN(n_channels=n_channels, n_classes=n_classes)
+        results["CNN"] = train_torch(
+            cnn, X_train, y_train_m, X_test, y_test_m
         )
-        train_ds = build_device_specific_dataset(train_ds, device_mode)
 
-        for test_f in config["force_levels"]:
-            test_ds = build_single_force_dataset(dataset, test_f)
-            test_ds = build_device_specific_dataset(test_ds, device_mode)
+    # ---------- LSTM (trial-level) ----------
+    if "LSTM" in MODELS:
+        Xtr_seq, ytr_seq, len_tr = build_lstm_sequences(
+            X_train, y_train_m, trial_train
+        )
+        Xte_seq, yte_seq, len_te = build_lstm_sequences(
+            X_test, y_test_m, trial_test
+        )
 
-            results[device_mode][("B", test_f)] = run_models(
-                train_ds, test_ds, config
-            )
+        _, T, D = Xtr_seq.shape  # D = C * F
+
+        lstm = EMGLSTM(
+            input_size=D,
+            hidden_size=64,
+            num_classes=n_classes
+        )
+
+        results["LSTM"] = train_torch_lstm(
+            lstm,
+            Xtr_seq,
+            ytr_seq,
+            len_tr,
+            Xte_seq,
+            yte_seq,
+            len_te,
+        )
 
     return results
 
 
-def run_models(train_ds, test_ds, config):
-    """
-    Execute multiple gesture recognition models.
-    """
+# ===========================
+# 🧠 Main Pipeline
+# ===========================
 
-    X_train, y_train, X_test, y_test = split_train_test(
-        train_ds, test_ds
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("[1] Building dataset...")
+    dataset = build_dataset(DATA_ROOT, WINDOW_MS, STEP_MS)
+
+    dataset = apply_mask(
+        dataset, np.isin(dataset["force"], FORCE_LEVELS)
     )
 
-    model_results = {}
+    results = {}
 
-    # ---- SVM ----
-    svm = SVMClassifier(**config["svm"])
-    model_results["SVM"] = evaluate_model(
-        svm, X_train, y_train, X_test, y_test
-    )
+    for device_name, device_ids in DEVICE_GROUPS.items():
+        print(f"\n[DEVICE] {device_name}")
+        results[device_name] = {}
 
-    # ---- CNN ----
-    cnn = EMGCNN(
-        n_channels=X_train.shape[1],
-        n_classes=len(set(y_train)),
-        **config["cnn"]
-    )
-    model_results["CNN"] = evaluate_model(
-        cnn, X_train, y_train, X_test, y_test
-    )
+        dset = apply_mask(
+            dataset, np.isin(dataset["collector"], device_ids)
+        )
 
-    # ---- LSTM ----
-    lstm = EMGLSTM(
-        input_size=X_train.shape[2],
-        num_classes=len(set(y_train)),
-        **config["lstm"]
-    )
-    model_results["LSTM"] = evaluate_model(
-        lstm, X_train, y_train, X_test, y_test
-    )
+        # ======================================================
+        # A️⃣ single-force → different-force
+        # ======================================================
+        for train_force in FORCE_LEVELS:
+            for test_force in FORCE_LEVELS:
+                if train_force == test_force:
+                    continue
 
-    return model_results
+                split = split_by_force_level(
+                    dset,
+                    test_force=test_force,
+                    train_forces_mixed=(train_force,),
+                )
+
+                ytr = split["train_cross"]["gesture"]
+                yte = split["test"]["gesture"]
+
+                if len(np.unique(ytr)) < 2:
+                    continue
+
+                key = (train_force, test_force)
+                results[device_name][key] = {}
+
+                for feat in FEATURES_TO_RUN:
+                    Xtr = (
+                        split["train_cross"]["X"]
+                        if feat == "ALL"
+                        else split["train_cross"]["single_feature_data"][feat]
+                    )
+                    Xte = (
+                        split["test"]["X"]
+                        if feat == "ALL"
+                        else split["test"]["single_feature_data"][feat]
+                    )
+
+                    normalizer = SubjectNormalizer()
+
+                    results[device_name][key][feat] = run_models(
+                        normalizer.fit_transform(Xtr),
+                        ytr,
+                        normalizer.transform(Xte),
+                        yte,
+                        split["train_cross"]["trial"],
+                        split["test"]["trial"],
+                    )
+
+        # ======================================================
+        # B️⃣ mixed-force (balanced)
+        # ======================================================
+        for test_force in FORCE_LEVELS:
+            split = split_by_force_level(
+                dset,
+                test_force=test_force,
+                train_forces_mixed=tuple(
+                    f for f in FORCE_LEVELS if f != test_force
+                ),
+                balanced_split=True,
+            )
+
+            ytr = split["train_mixed_balanced"]["gesture"]
+            yte = split["test"]["gesture"]
+
+            key = ("mixed_balanced", test_force)
+            results[device_name][key] = {}
+
+            for feat in FEATURES_TO_RUN:
+                Xtr = (
+                    split["train_mixed_balanced"]["X"]
+                    if feat == "ALL"
+                    else split["train_mixed_balanced"]["single_feature_data"][feat]
+                )
+                Xte = (
+                    split["test"]["X"]
+                    if feat == "ALL"
+                    else split["test"]["single_feature_data"][feat]
+                )
+
+                normalizer = SubjectNormalizer()
+
+                results[device_name][key][feat] = run_models(
+                    normalizer.fit_transform(Xtr),
+                    ytr,
+                    normalizer.transform(Xte),
+                    yte,
+                    split["train_mixed_balanced"]["trial"],
+                    split["test"]["trial"],
+                )
+
+        # ======================================================
+        # C️⃣ same-force baseline
+        # ======================================================
+        for test_force in FORCE_LEVELS:
+            split = split_by_force_level(
+                dset,
+                test_force=test_force,
+                train_forces_mixed=(),
+            )
+
+            ytr = split["train_same"]["gesture"]
+            yte = split["test"]["gesture"]
+
+            key = ("same", test_force)
+            results[device_name][key] = {}
+
+            for feat in FEATURES_TO_RUN:
+                Xtr = (
+                    split["train_same"]["X"]
+                    if feat == "ALL"
+                    else split["train_same"]["single_feature_data"][feat]
+                )
+                Xte = (
+                    split["test"]["X"]
+                    if feat == "ALL"
+                    else split["test"]["single_feature_data"][feat]
+                )
+
+                normalizer = SubjectNormalizer()
+
+                results[device_name][key][feat] = run_models(
+                    normalizer.fit_transform(Xtr),
+                    ytr,
+                    normalizer.transform(Xte),
+                    yte,
+                    split["train_same"]["trial"],
+                    split["test"]["trial"],
+                )
+
+    reporter = ExperimentReporter(OUTPUT_DIR)
+    df = reporter.save(results)
+
+    ExperimentVisualizer(OUTPUT_DIR).generate_all(df)
+
+    print("\n✅ ALL EMG EXPERIMENTS FINISHED")
 
 
 if __name__ == "__main__":
-
-    experiment_config = {
-        "data_root": "./data",
-        "subjects": ["S1", "S2"],
-        "gestures": list(range(1, 9)),
-
-        "fs": 1000,
-        "bandpass": (20, 450),
-        "notch": 50,
-
-        "window_size": 200,
-        "window_step": 100,
-        "features": [
-            "MAV", "RMS", "WL", "ZC",
-            "AR", "FFT_MeanFreq"
-        ],
-
-        "force_levels": [10, 20, 30, 40, 50],
-        "samples_per_force": 100,
-        "device_modes": ["dev1", "dev2", "fusion"],
-
-        "svm": {"kernel": "rbf", "C": 1.0},
-        "cnn": {"hidden_channels": 64},
-        "lstm": {"hidden_size": 64}
-    }
-
-    # Run experiment
-    results = run_experiment(experiment_config)
-
-    # Report generation
-    report_dir = "./outputs/experiment_01"
-
-    reporter = ExperimentReporter(report_dir)
-    df = reporter.save(results)
-
-    # Visualization generation
-    visualizer = ExperimentVisualizer(report_dir)
-    visualizer.generate_all(df)
+    main()
