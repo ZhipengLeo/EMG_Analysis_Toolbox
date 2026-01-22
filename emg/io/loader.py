@@ -24,8 +24,15 @@ def load_emg_dataset(root: str | Path) -> dict[str, list[EMGData]]:
     for h5_file in sorted(root.rglob("*.h5")):
         try:
             emg_data = read_h5_action_only(h5_file)
+            # cid = emg_data.meta["collector_id"]
+            # datasets[cid].append(emg_data)
+
+            emg_data.meta["filename"] = h5_file.name
+            emg_data.meta["filepath"] = str(h5_file)
+
             cid = emg_data.meta["collector_id"]
             datasets[cid].append(emg_data)
+
         except Exception as e:
             print(f"[SKIP] {h5_file.name}: {e}")
 

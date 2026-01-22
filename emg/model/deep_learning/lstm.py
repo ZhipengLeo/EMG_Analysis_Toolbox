@@ -1,0 +1,27 @@
+import torch
+import torch.nn as nn
+
+class EMGLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            batch_first=True
+        )
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x, lengths):
+        # x: (B, T_max, D)
+
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x,
+            lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False
+        )
+
+        _, (h_n, _) = self.lstm(packed)
+
+        # h_n: (1, B, hidden)
+        return self.fc(h_n[-1])

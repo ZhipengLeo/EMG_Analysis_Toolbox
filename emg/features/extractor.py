@@ -56,3 +56,38 @@ def sliding_window_feature_extraction(
         features.append(win_feat)
 
     return np.array(features)
+
+def build_single_feature_datasets(
+    X: np.ndarray,
+    feature_names=FEATURE_NAMES,
+    keep_feature_dim: bool = False
+):
+    """
+    Parameters
+    ----------
+    X : np.ndarray
+        shape = (n_windows, n_channels, n_features)
+    keep_feature_dim : bool
+        True  -> (n_windows, n_channels, 1)
+        False -> (n_windows, n_channels)
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        key: feature name
+        value: single-feature dataset
+    """
+    assert X.ndim == 3, "X must be (n_windows, n_channels, n_features)"
+
+    datasets = {}
+
+    for i, name in enumerate(feature_names):
+        Xi = X[:, :, i]          # (n_windows, n_channels)
+
+        if keep_feature_dim:
+            Xi = Xi[:, :, None]  # (n_windows, n_channels, 1)
+
+        datasets[name] = Xi
+
+    return datasets
+
